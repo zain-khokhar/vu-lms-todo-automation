@@ -2,6 +2,39 @@ import { NextResponse } from 'next/server';
 import puppeteer from 'puppeteer';
 import { loginToLMS, navigateToCalendar, scrapeActivities, logout, wait } from '@/lib/scraper';
 import { formatStudentResult } from '@/lib/activityParser';
+import db from '@/lib/db';
+import logger from '@/lib/logger';
+import User from '@/models/User';
+import Activity from '@/models/Activity';
+import scheduler from '@/lib/scheduler';
+
+// Format WhatsApp summary message for immediate notification
+function formatWhatsAppSummary(username, activities) {
+  const now = new Date();
+  const upcoming = activities.filter(a => {
+    const due = new Date(a.due_date);
+    const diff = (due - now) / (1000 * 60 * 60 * 24);
+    return diff <= 7; // Activities due within 7 days
+  });
+
+  let message = `📚 *VU LMS Activity Summary*\n`;
+  message += `👤 Student: ${username}\n`;
+  message += `📅 ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}\n\n`;
+
+  if (upcoming.length > 0) {
+    message += `⚠️ *${upcoming.length} Activities Due This Week:*\n\n`;
+    upcoming.forEach((act, idx) => {
+      message += `${idx + 1}. *${act.activity_type}* - ${act.course_code}\n`;
+      message += `   📝 ${act.title}\n`;
+      message += `   ⏰ Due: ${act.due_date}\n\n`;
+    });
+  }
+
+  message += `📊 Total Upcoming: ${activities.length} activities\n\n`;
+  message += `_Automated by VU LMS Automation_`;
+
+  return message;
+}
 
 export async function POST(request) {
   let browser = null;
@@ -17,7 +50,10 @@ export async function POST(request) {
       );
     }
 
-    console.log(`[API] Starting automation for ${students.length} student(s)`);
+    logger.info(`[API] Starting automation for ${students.length} student(s)`);
+
+    // Connect to database
+    await db.connect();
 
     // Launch browser with enhanced stability settings
     browser = await puppeteer.launch({
@@ -50,7 +86,7 @@ export async function POST(request) {
       const student = students[i];
       const { username, password, whatsapp } = student;
 
-      console.log(`\n[API] Processing student ${i + 1}/${students.length}: ${username}`);
+      logger.info(`[API] Processing student ${i + 1}/${students.length}: ${username}`);
 
       // Create new page for this student
       const page = await browser.newPage();
@@ -61,16 +97,41 @@ export async function POST(request) {
       // Block unnecessary resources to reduce memory usage and improve speed
       await page.setRequestInterception(true);
       page.on('request', (req) => {
-        const resourceType = req.resourceType();
-        if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-          req.abort();
-        } else {
-          req.continue();
+        try {
+          const resourceType = req.resourceType();
+          if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+            req.abort().catch(() => {});
+          } else {
+            req.continue().catch(() => {});
+          }
+        } catch (error) {
+          // Ignore interception errors to prevent crashes
+          req.continue().catch(() => {});
         }
       });
 
       try {
-        // Step 1: Login
+        // Step 1: Find or create user in database
+        let user = await User.findOne({ username });
+        
+        if (!user) {
+          logger.info(`[API] Creating new user: ${username}`);
+          user = await User.create({
+            username,
+            password,
+            whatsapp,
+            isActive: true
+          });
+        } else {
+          logger.info(`[API] User exists: ${username}`);
+          // Update WhatsApp number if changed
+          if (user.whatsapp !== whatsapp) {
+            user.whatsapp = whatsapp;
+            await user.save();
+          }
+        }
+
+        // Step 2: Login
         const loginSuccess = await loginToLMS(page, username, password);
         
         if (!loginSuccess) {
@@ -87,13 +148,13 @@ export async function POST(request) {
           
           // Wait before next student (even on error)
           if (i < students.length - 1) {
-            console.log('[API] Waiting 60 seconds before next student...');
+            logger.info('[API] Waiting 60 seconds before next student...');
             await wait(parseInt(process.env.WAIT_TIME_MS) || 60000);
           }
           continue;
         }
 
-        // Step 2: Navigate to Activity Calendar
+        // Step 3: Navigate to Activity Calendar
         const navSuccess = await navigateToCalendar(page);
         
         if (!navSuccess) {
@@ -110,32 +171,124 @@ export async function POST(request) {
           await page.close();
           
           if (i < students.length - 1) {
-            console.log('[API] Waiting 60 seconds before next student...');
+            logger.info('[API] Waiting 60 seconds before next student...');
             await wait(parseInt(process.env.WAIT_TIME_MS) || 60000);
           }
           continue;
         }
 
-        // Step 3: Scrape activities
+        // Step 4: Scrape activities
         const activities = await scrapeActivities(page);
 
-        // Step 4: Logout
+        // Step 5: Logout
         await logout(page);
 
+        // Step 6: Filter out past activities and save to database
+        const now = new Date();
+        const futureActivities = [];
+        let savedCount = 0;
+        let scheduledCount = 0;
+
+        for (const activity of activities) {
+          try {
+            // Parse dates
+            const dueDate = activity.due_date ? new Date(activity.due_date) : null;
+            const startDate = activity.start_date ? new Date(activity.start_date) : null;
+
+            // Skip if no due date or due date is in the past
+            if (!dueDate || dueDate < now) {
+              logger.info(`[API] Skipping past activity: ${activity.title} (due: ${activity.due_date})`);
+              continue;
+            }
+
+            futureActivities.push(activity);
+
+            // Generate activity hash
+            const activityHash = Activity.generateHash(
+              user._id,
+              activity.course_code,
+              activity.title,
+              dueDate
+            );
+
+            // Check if activity already exists
+            let existingActivity = await Activity.findOne({ activityHash });
+
+            if (!existingActivity) {
+              // Save new activity to database
+              existingActivity = await Activity.create({
+                userId: user._id,
+                courseCode: activity.course_code,
+                activityType: activity.activity_type,
+                title: activity.title,
+                startDate: startDate,
+                dueDate: dueDate,
+                link: activity.link,
+                activityHash: activityHash
+              });
+
+              savedCount++;
+              logger.info(`[API] Saved new activity: ${activity.title}`);
+
+              // Schedule notifications for this activity
+              const notifications = await scheduler.scheduleNotifications(existingActivity);
+              scheduledCount += notifications.length;
+              logger.info(`[API] Scheduled ${notifications.length} notifications for: ${activity.title}`);
+            } else {
+              logger.info(`[API] Activity already exists: ${activity.title}`);
+            }
+
+          } catch (activityError) {
+            logger.error(`[API] Error processing activity ${activity.title}: ${activityError.message}`);
+            console.error('[API] Full error:', activityError);
+          }
+        }
+
         // Add successful result
-        results.push(
-          formatStudentResult(
+        results.push({
+          ...formatStudentResult(
             username,
             whatsapp,
-            activities,
+            futureActivities,
             'success'
-          )
-        );
+          ),
+          database: {
+            saved: savedCount,
+            scheduled: scheduledCount,
+            total: activities.length,
+            future: futureActivities.length
+          }
+        });
 
-        console.log(`[API] ✓ Completed processing for ${username}: ${activities.length} activities found`);
+        logger.info(`[API] ✓ Completed processing for ${username}: ${activities.length} total, ${futureActivities.length} future activities, ${savedCount} new, ${scheduledCount} notifications scheduled`);
+
+        // Send immediate WhatsApp summary via HTTP call to server process
+        if (futureActivities.length > 0) {
+          try {
+            const summaryMessage = formatWhatsAppSummary(username, futureActivities);
+            const waResponse = await fetch('http://localhost:3001/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ phone: whatsapp, message: summaryMessage })
+            });
+            if (waResponse.ok) {
+              logger.info(`[API] ✓ Sent WhatsApp summary to ${whatsapp}`);
+            } else {
+              const waError = await waResponse.json();
+              logger.warn(`[API] WhatsApp send failed: ${waError.error}`);
+            }
+          } catch (waError) {
+            logger.error(`[API] Failed to send WhatsApp summary:`, waError.message);
+          }
+        }
 
       } catch (error) {
-        console.error(`[API] Error processing ${username}:`, error.message);
+        // Log full error details for debugging
+        logger.error(`[API] Error processing ${username}:`, {
+          message: error.message || 'Unknown error',
+          stack: error.stack || 'No stack trace available',
+          error: error
+        });
         
         results.push(
           formatStudentResult(
@@ -143,7 +296,7 @@ export async function POST(request) {
             whatsapp,
             [],
             'error',
-            `Processing error: ${error.message}`
+            `Processing error: ${error.message || error.toString() || 'Unknown error occurred'}`
           )
         );
       } finally {
@@ -156,22 +309,22 @@ export async function POST(request) {
             
             // Close the page safely
             await page.close().catch((closeError) => {
-              console.warn(`[API] Page close warning: ${closeError.message}`);
+              logger.warn(`[API] Page close warning: ${closeError.message}`);
             });
           }
         } catch (cleanupError) {
-          console.warn(`[API] Cleanup warning for ${username}: ${cleanupError.message}`);
+          logger.warn(`[API] Cleanup warning for ${username}: ${cleanupError.message}`);
         }
       }
 
       // Wait exactly 60 seconds before processing next student (except for the last one)
       if (i < students.length - 1) {
-        console.log('[API] Waiting 60 seconds before next student...');
+        logger.info('[API] Waiting 60 seconds before next student...');
         await wait(parseInt(process.env.WAIT_TIME_MS) || 60000);
       }
     }
 
-    console.log('\n[API] ✓ Automation completed for all students');
+    logger.info('[API] ✓ Automation completed for all students');
 
     return NextResponse.json({
       success: true,
@@ -180,7 +333,7 @@ export async function POST(request) {
     });
 
   } catch (error) {
-    console.error('[API] Fatal error:', error);
+    logger.error('[API] Fatal error:', error);
     
     return NextResponse.json(
       {
@@ -210,12 +363,12 @@ export async function POST(request) {
         
         // Close the browser
         await browser.close().catch((err) => {
-          console.warn('[API] Browser close warning:', err.message);
+          logger.warn('[API] Browser close warning:', err.message);
         });
         
-        console.log('[API] Browser closed');
+        logger.info('[API] Browser closed');
       } catch (browserCleanupError) {
-        console.warn('[API] Browser cleanup warning:', browserCleanupError.message);
+        logger.warn('[API] Browser cleanup warning:', browserCleanupError.message);
       }
     }
   }

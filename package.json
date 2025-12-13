@@ -2,21 +2,30 @@
   "name": "lms-todo-automation",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "dev": "concurrently -n \"SERVER,NEXT\" -c \"blue,green\" \"node server.js\" \"next dev --webpack\"",
+    "build": "next build --webpack",
+    "start": "concurrently \"node server.js\" \"next start\"",
+    "server": "node server.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.2.3",
     "mongoose": "^9.0.1",
     "next": "16.0.10",
+    "node-cron": "^4.2.1",
     "puppeteer": "^24.33.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
     "react": "19.2.1",
-    "react-dom": "19.2.1"
+    "react-dom": "19.2.1",
+    "whatsapp-web.js": "^1.34.2",
+    "winston": "^3.19.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "concurrently": "^9.2.1",
     "tailwindcss": "^4"
   }
 }
