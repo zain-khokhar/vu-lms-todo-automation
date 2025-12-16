@@ -88,32 +88,34 @@ class NotificationScheduler {
   formatMessage(activity, notificationType) {
     const emoji = notificationType === 'start' ? '🔔 *NEW ACTIVITY*' : '⏰ *DEADLINE REMINDER*';
     
-    const startDateStr = activity.startDate 
-      ? new Date(activity.startDate).toLocaleDateString('en-US', { 
-          year: 'numeric', 
-          month: 'short', 
-          day: 'numeric' 
-        })
-      : 'N/A';
-    
-    const dueDateStr = new Date(activity.dueDate).toLocaleDateString('en-US', { 
+    const dueDate = new Date(activity.dueDate);
+    const dueDateStr = dueDate.toLocaleDateString('en-US', { 
+      weekday: 'long',
       year: 'numeric', 
-      month: 'short', 
+      month: 'long', 
       day: 'numeric' 
     });
 
+    // Calculate days remaining
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const dueDateClean = new Date(dueDate);
+    dueDateClean.setHours(0, 0, 0, 0);
+    const daysRemaining = Math.ceil((dueDateClean - now) / (1000 * 60 * 60 * 24));
+
     return `${emoji}
 
-📚 *${activity.activityType}* for *${activity.courseCode}*
+📚 *Course:* ${activity.courseCode}
+📋 *Type:* ${activity.activityType}
+📝 *Title:* ${activity.title}
 
-${activity.title}
+📅 *Due Date:* ${dueDateStr}
+⏳ *Days Remaining:* ${daysRemaining} day${daysRemaining !== 1 ? 's' : ''}
 
-📅 Start: ${startDateStr}
-⏰ Due: ${dueDateStr}
+🔗 ${activity.link}
 
-🔗 Link: ${activity.link}
-
-_Automated notification from VU LMS Automation_`;
+━━━━━━━━━━━━━━━━━━━━━
+*POWERED BY VUEDU*`;
   }
 
   /**

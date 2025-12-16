@@ -213,132 +213,188 @@ export async function scrapeActivities(page) {
 
       const activityMap = new Map(); // Use Map to deduplicate activities
       
-      // Find all calendar event elements
-      const eventElements = calendar.querySelectorAll('a.fc-day-grid-event');
-      
-      console.log(`Found ${eventElements.length} event elements`);
-      
-      eventElements.forEach(eventEl => {
-        try {
-          // Extract title
-          const titleEl = eventEl.querySelector('.fc-title');
-          if (!titleEl) return;
-          
-          const title = titleEl.innerText.trim();
-          const link = eventEl.href;
-          
-          // Parse course code from title (e.g., "CS201P: Quiz")
-          const courseCodeMatch = title.match(/^([A-Z]{2,4}\d{3,4}[A-Z]?)/);
-          const courseCode = courseCodeMatch ? courseCodeMatch[1] : '';
-          
-          // Determine activity type from title and link
-          let activityType = 'Unknown';
-          const lowerTitle = title.toLowerCase();
-          const lowerLink = link.toLowerCase();
-          
-          if (lowerTitle.includes('assignment') || lowerLink.includes('assignment')) {
-            activityType = 'Assignment';
-          } else if (lowerTitle.includes('quiz') && lowerTitle.includes('result')) {
-            activityType = 'Quiz Result';
-          } else if (lowerTitle.includes('quiz') || lowerLink.includes('quiz')) {
-            activityType = 'Quiz';
-          } else if (lowerTitle.includes('gdb') && lowerTitle.includes('result')) {
-            activityType = 'GDB Result';
-          } else if (lowerTitle.includes('gdb') || lowerLink.includes('gdb')) {
-            activityType = 'GDB';
-          } else if (lowerTitle.includes('fee') || lowerTitle.includes('challan') || lowerLink.includes('challan')) {
-            activityType = 'Pending Fee';
-          }
-          
-          // Determine if this is a start or end point
-          const isStart = eventEl.classList.contains('fc-start');
-          const isEnd = eventEl.classList.contains('fc-end');
-          
-          // Find the parent event container to get date information
-          let eventContainer = eventEl.closest('.fc-event-container');
-          if (!eventContainer) return;
-          
-          // Find all date cells in the current week row
-          let currentRow = eventContainer.closest('.fc-row');
-          if (!currentRow) return;
-          
-          // Get all date cells in this row
-          const dateCells = currentRow.querySelectorAll('td.fc-day[data-date]');
-          
-          // Find which date cell(s) this event spans
-          let startDate = null;
-          let endDate = null;
-          
-          // Get the container's parent TD to find its position
-          const containerTd = eventContainer.closest('td');
-          if (containerTd) {
-            const colspan = parseInt(containerTd.getAttribute('colspan') || '1');
-            
-            // Find the index of this container in the row
-            const allCells = Array.from(currentRow.querySelectorAll('td.fc-day[data-date], td.fc-event-container'));
-            let containerIndex = allCells.indexOf(containerTd);
-            
-            // Find the corresponding date cells
-            const dateCellsArray = Array.from(dateCells);
-            
-            // If it's a start event, use the first date in the span
-            if (isStart && dateCellsArray.length > 0) {
-              // Find the date cell that corresponds to this position
-              let dateIndex = 0;
-              for (let i = 0; i < allCells.length && i < containerIndex; i++) {
-                if (allCells[i].classList.contains('fc-day')) {
-                  dateIndex++;
-                }
-              }
-              startDate = dateCellsArray[dateIndex]?.getAttribute('data-date') || null;
-            }
-            
-            // If it's an end event, use the last date in the span
-            if (isEnd && dateCellsArray.length > 0) {
-              let dateIndex = 0;
-              for (let i = 0; i < allCells.length && i <= containerIndex; i++) {
-                if (allCells[i].classList.contains('fc-day')) {
-                  dateIndex++;
-                }
-              }
-              // Add colspan to get the end date
-              dateIndex = Math.min(dateIndex + colspan - 1, dateCellsArray.length - 1);
-              endDate = dateCellsArray[dateIndex]?.getAttribute('data-date') || null;
-            }
-          }
-          
-          // Create a unique key for this activity
-          const activityKey = `${courseCode}|${title}`;
-          
-          // Update or create activity entry
-          if (activityMap.has(activityKey)) {
-            const existing = activityMap.get(activityKey);
-            // Update dates if we found more specific information
-            if (startDate && !existing.start_date) {
-              existing.start_date = startDate;
-            }
-            if (endDate) {
-              existing.due_date = endDate;
-            }
-          } else {
-            activityMap.set(activityKey, {
-              course_code: courseCode || 'N/A',
-              activity_type: activityType,
-              title: title,
-              start_date: startDate || '',
-              due_date: endDate || '',
-              link: link
-            });
-          }
-        } catch (err) {
-          console.error('Error parsing event:', err);
+      // Try to get events directly from FullCalendar instance
+      let eventsFromFC = [];
+      try {
+        // Check if FullCalendar instance exists
+        const fcElement = document.querySelector('#calendar');
+        if (window.$ && fcElement && window.$(fcElement).data('fullCalendar')) {
+          const fcInstance = window.$(fcElement).fullCalendar('clientEvents');
+          eventsFromFC = fcInstance || [];
+          console.log(`Found ${eventsFromFC.length} events from FullCalendar API`);
         }
-      });
+      } catch (e) {
+        console.log('Could not access FullCalendar API, falling back to DOM parsing');
+      }
+
+      // Get current month for filtering
+      const now = new Date();
+      const currentMonth = now.getMonth();
+      const currentYear = now.getFullYear();
+      
+      // Process events from FullCalendar API if available
+      if (eventsFromFC.length > 0) {
+        eventsFromFC.forEach(event => {
+          try {
+            const title = event.title || '';
+            const link = event.url || '';
+            const startDate = event.start ? event.start.toISOString().split('T')[0] : '';
+            
+            // FullCalendar end dates are EXCLUSIVE (next day at midnight)
+            // Subtract 1 day to get the actual last day
+            let endDate = startDate;
+            if (event.end) {
+              const endDateObj = new Date(event.end);
+              endDateObj.setDate(endDateObj.getDate() - 1);
+              endDate = endDateObj.toISOString().split('T')[0];
+            }
+            
+            // Filter: Only include activities from current month
+            const activityDate = new Date(endDate || startDate);
+            if (activityDate.getMonth() !== currentMonth || activityDate.getFullYear() !== currentYear) {
+              return; // Skip activities not in current month
+            }
+            
+            // Parse course code from title
+            const courseCodeMatch = title.match(/^([A-Z]{2,4}\d{3,4}[A-Z]?)/);
+            const courseCode = courseCodeMatch ? courseCodeMatch[1] : '';
+            
+            // Determine activity type
+            let activityType = 'Unknown';
+            const lowerTitle = title.toLowerCase();
+            const lowerLink = link.toLowerCase();
+            
+            if (lowerTitle.includes('assignment') || lowerLink.includes('assignment')) {
+              activityType = 'Assignment';
+            } else if (lowerTitle.includes('quiz') && lowerTitle.includes('result')) {
+              activityType = 'Quiz Result';
+            } else if (lowerTitle.includes('quiz') || lowerLink.includes('quiz')) {
+              activityType = 'Quiz';
+            } else if (lowerTitle.includes('gdb') && lowerTitle.includes('result')) {
+              activityType = 'GDB Result';
+            } else if (lowerTitle.includes('gdb') || lowerLink.includes('gdb')) {
+              activityType = 'GDB';
+            } else if (lowerTitle.includes('fee') || lowerTitle.includes('challan') || lowerLink.includes('challan')) {
+              activityType = 'Pending Fee';
+            }
+            
+            const activityKey = `${courseCode}|${title}`;
+            
+            if (!activityMap.has(activityKey)) {
+              activityMap.set(activityKey, {
+                course_code: courseCode || 'N/A',
+                activity_type: activityType,
+                title: title,
+                start_date: startDate,
+                due_date: endDate,
+                link: link
+              });
+            }
+          } catch (err) {
+            console.error('Error parsing FC event:', err);
+          }
+        });
+      } else {
+        // Fallback: Parse from DOM elements
+        const eventElements = calendar.querySelectorAll('a.fc-day-grid-event');
+        console.log(`Found ${eventElements.length} event elements in DOM`);
+        
+        eventElements.forEach(eventEl => {
+          try {
+            // Extract title
+            const titleEl = eventEl.querySelector('.fc-title');
+            if (!titleEl) return;
+            
+            const title = titleEl.innerText.trim();
+            const link = eventEl.href;
+            
+            // Parse course code from title
+            const courseCodeMatch = title.match(/^([A-Z]{2,4}\d{3,4}[A-Z]?)/);
+            const courseCode = courseCodeMatch ? courseCodeMatch[1] : '';
+            
+            // Determine activity type
+            let activityType = 'Unknown';
+            const lowerTitle = title.toLowerCase();
+            const lowerLink = link.toLowerCase();
+            
+            if (lowerTitle.includes('assignment') || lowerLink.includes('assignment')) {
+              activityType = 'Assignment';
+            } else if (lowerTitle.includes('quiz') && lowerTitle.includes('result')) {
+              activityType = 'Quiz Result';
+            } else if (lowerTitle.includes('quiz') || lowerLink.includes('quiz')) {
+              activityType = 'Quiz';
+            } else if (lowerTitle.includes('gdb') && lowerTitle.includes('result')) {
+              activityType = 'GDB Result';
+            } else if (lowerTitle.includes('gdb') || lowerLink.includes('gdb')) {
+              activityType = 'GDB';
+            } else if (lowerTitle.includes('fee') || lowerTitle.includes('challan') || lowerLink.includes('challan')) {
+              activityType = 'Pending Fee';
+            }
+            
+            // Get date from parent cell
+            let startDate = '';
+            let endDate = '';
+            
+            // Find the parent TD with data-date attribute
+            const parentTd = eventEl.closest('td[data-date]');
+            if (parentTd) {
+              const cellDate = parentTd.getAttribute('data-date');
+              
+              // Check if event spans multiple days
+              const isStart = eventEl.classList.contains('fc-start');
+              const isEnd = eventEl.classList.contains('fc-end');
+              const isNotStart = eventEl.classList.contains('fc-not-start');
+              const isNotEnd = eventEl.classList.contains('fc-not-end');
+              
+              // If it's a start, this is the start date
+              if (isStart) {
+                startDate = cellDate;
+              }
+              
+              // If it's an end, this is the end date
+              if (isEnd) {
+                endDate = cellDate;
+              }
+              
+              // If it's single-day event (both start and end)
+              if (isStart && isEnd) {
+                startDate = cellDate;
+                endDate = cellDate;
+              }
+            }
+            
+            // Create unique key
+            const activityKey = `${courseCode}|${title}`;
+            
+            // Merge with existing or create new
+            if (activityMap.has(activityKey)) {
+              const existing = activityMap.get(activityKey);
+              if (startDate && !existing.start_date) {
+                existing.start_date = startDate;
+              }
+              if (endDate) {
+                existing.due_date = endDate;
+              }
+            } else {
+              activityMap.set(activityKey, {
+                course_code: courseCode || 'N/A',
+                activity_type: activityType,
+                title: title,
+                start_date: startDate,
+                due_date: endDate,
+                link: link
+              });
+            }
+          } catch (err) {
+            console.error('Error parsing event element:', err);
+          }
+        });
+      }
       
       // Convert map to array
       const activityList = Array.from(activityMap.values());
       
-      // Filter out Result activities if needed (optional)
+      // Return all activities (don't filter here, let the API route handle filtering)
       return activityList.filter(activity => 
         activity.title && activity.link
       );

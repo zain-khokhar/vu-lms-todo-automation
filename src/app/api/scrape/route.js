@@ -8,32 +8,49 @@ import User from '@/models/User';
 import Activity from '@/models/Activity';
 import scheduler from '@/lib/scheduler';
 
-// Format WhatsApp summary message for immediate notification
-function formatWhatsAppSummary(username, activities) {
-  const now = new Date();
-  const upcoming = activities.filter(a => {
-    const due = new Date(a.due_date);
-    const diff = (due - now) / (1000 * 60 * 60 * 24);
-    return diff <= 7; // Activities due within 7 days
+// Format single activity message for WhatsApp - SIMPLIFIED FORMAT
+function formatActivityMessage(activity) {
+  const dueDate = new Date(activity.due_date);
+  const formattedDueDate = dueDate.toLocaleDateString('en-US', { 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric' 
   });
-
-  let message = `📚 *VU LMS Activity Summary*\n`;
-  message += `👤 Student: ${username}\n`;
-  message += `📅 ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}\n\n`;
-
-  if (upcoming.length > 0) {
-    message += `⚠️ *${upcoming.length} Activities Due This Week:*\n\n`;
-    upcoming.forEach((act, idx) => {
-      message += `${idx + 1}. *${act.activity_type}* - ${act.course_code}\n`;
-      message += `   📝 ${act.title}\n`;
-      message += `   ⏰ Due: ${act.due_date}\n\n`;
-    });
-  }
-
-  message += `📊 Total Upcoming: ${activities.length} activities\n\n`;
-  message += `_Automated by VU LMS Automation_`;
+  
+  let message = `*${activity.course_code}*\n`;
+  message += `${activity.activity_type}\n`;
+  message += `Due: ${formattedDueDate}`;
 
   return message;
+}
+
+// Filter activities for next 7 days from today (within current month)
+function getUpcomingActivities(activities) {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0); // Start of today
+  
+  const sevenDaysLater = new Date(now);
+  sevenDaysLater.setDate(sevenDaysLater.getDate() + 7);
+  sevenDaysLater.setHours(23, 59, 59, 999); // End of 7th day
+  
+  const currentMonth = now.getMonth();
+  const currentYear = now.getFullYear();
+
+  return activities.filter(activity => {
+    if (!activity.due_date) return false;
+    
+    const dueDate = new Date(activity.due_date);
+    dueDate.setHours(12, 0, 0, 0); // Normalize to noon
+    
+    const dueDateMonth = dueDate.getMonth();
+    const dueDateYear = dueDate.getFullYear();
+    
+    // Must be: 1) from today onwards, 2) within 7 days, 3) in current month
+    const isInCurrentMonth = dueDateYear === currentYear && dueDateMonth === currentMonth;
+    const isWithin7Days = dueDate >= now && dueDate <= sevenDaysLater;
+    
+    return isInCurrentMonth && isWithin7Days;
+  }).sort((a, b) => new Date(a.due_date) - new Date(b.due_date)); // Sort by due date
 }
 
 export async function POST(request) {
@@ -183,8 +200,11 @@ export async function POST(request) {
         // Step 5: Logout
         await logout(page);
 
-        // Step 6: Filter out past activities and save to database
+        // Step 6: Process and categorize activities
         const now = new Date();
+        now.setHours(0, 0, 0, 0); // Start of today
+        
+        const pastActivities = [];
         const futureActivities = [];
         let savedCount = 0;
         let scheduledCount = 0;
@@ -195,10 +215,13 @@ export async function POST(request) {
             const dueDate = activity.due_date ? new Date(activity.due_date) : null;
             const startDate = activity.start_date ? new Date(activity.start_date) : null;
 
-            // Skip if no due date or due date is in the past
-            if (!dueDate || dueDate < now) {
-              logger.info(`[API] Skipping past activity: ${activity.title} (due: ${activity.due_date})`);
-              continue;
+            // Categorize as past or future
+            const isPast = !dueDate || dueDate < now;
+            
+            if (isPast) {
+              pastActivities.push(activity);
+              logger.info(`[API] Past activity: ${activity.title} (due: ${activity.due_date})`);
+              continue; // Don't save past activities
             }
 
             futureActivities.push(activity);
@@ -244,42 +267,39 @@ export async function POST(request) {
           }
         }
 
-        // Add successful result
+        // Add successful result with ALL activities (past + future)
         results.push({
           ...formatStudentResult(
             username,
             whatsapp,
-            futureActivities,
+            activities, // Return ALL activities, not just future
             'success'
           ),
           database: {
             saved: savedCount,
             scheduled: scheduledCount,
             total: activities.length,
+            past: pastActivities.length,
             future: futureActivities.length
           }
         });
 
-        logger.info(`[API] ✓ Completed processing for ${username}: ${activities.length} total, ${futureActivities.length} future activities, ${savedCount} new, ${scheduledCount} notifications scheduled`);
+        logger.info(`[API] ✓ Completed processing for ${username}: ${activities.length} total (${pastActivities.length} past, ${futureActivities.length} future), ${savedCount} new, ${scheduledCount} notifications scheduled`);
 
-        // Send immediate WhatsApp summary via HTTP call to server process
-        if (futureActivities.length > 0) {
-          try {
-            const summaryMessage = formatWhatsAppSummary(username, futureActivities);
-            const waResponse = await fetch('http://localhost:3001/send', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ phone: whatsapp, message: summaryMessage })
-            });
-            if (waResponse.ok) {
-              logger.info(`[API] ✓ Sent WhatsApp summary to ${whatsapp}`);
-            } else {
-              const waError = await waResponse.json();
-              logger.warn(`[API] WhatsApp send failed: ${waError.error}`);
-            }
-          } catch (waError) {
-            logger.error(`[API] Failed to send WhatsApp summary:`, waError.message);
-          }
+        // Queue WhatsApp messages for later sending
+        const upcomingWeek = getUpcomingActivities(futureActivities);
+        
+        if (upcomingWeek.length > 0) {
+          logger.info(`[API] Queueing ${upcomingWeek.length} WhatsApp messages for ${username}`);
+          
+          // Store in results for batch sending after all students processed
+          results[results.length - 1].whatsappQueue = upcomingWeek.map(activity => ({
+            phone: whatsapp,
+            activity: activity,
+            studentName: username
+          }));
+        } else {
+          logger.info(`[API] No activities due in next 7 days (current month) for ${username}`);
         }
 
       } catch (error) {
@@ -326,10 +346,100 @@ export async function POST(request) {
 
     logger.info('[API] ✓ Automation completed for all students');
 
+    // Process WhatsApp queue - send messages after ensuring WhatsApp is ready
+    logger.info('[API] Processing WhatsApp message queue...');
+    
+    let totalQueued = 0;
+    let totalSent = 0;
+    let totalFailed = 0;
+    
+    // Check WhatsApp status first
+    try {
+      const statusResponse = await fetch('http://localhost:3001/status', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+      const statusData = await statusResponse.json();
+      
+      if (statusData.status !== 'ready') {
+        logger.warn('[API] WhatsApp not ready yet, waiting 5 seconds...');
+        await wait(5000);
+        
+        // Check again
+        const retryStatusResponse = await fetch('http://localhost:3001/status');
+        const retryStatusData = await retryStatusResponse.json();
+        
+        if (retryStatusData.status !== 'ready') {
+          logger.error('[API] WhatsApp still not ready, messages will not be sent');
+          return NextResponse.json({
+            success: true,
+            total: students.length,
+            results: results,
+            whatsapp: {
+              status: 'not_ready',
+              queued: totalQueued,
+              sent: 0,
+              failed: 0
+            }
+          });
+        }
+      }
+      
+      logger.info('[API] WhatsApp is ready, sending queued messages...');
+      
+      // Send all queued messages
+      for (const result of results) {
+        if (result.whatsappQueue && result.whatsappQueue.length > 0) {
+          totalQueued += result.whatsappQueue.length;
+          
+          for (const queueItem of result.whatsappQueue) {
+            try {
+              const activityMessage = formatActivityMessage(queueItem.activity);
+              const waResponse = await fetch('http://localhost:3001/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                  phone: queueItem.phone, 
+                  message: activityMessage 
+                })
+              });
+              
+              if (waResponse.ok) {
+                totalSent++;
+                logger.info(`[API] ✓ Sent WhatsApp to ${queueItem.phone}: ${queueItem.activity.title}`);
+              } else {
+                totalFailed++;
+                const waError = await waResponse.json();
+                logger.warn(`[API] WhatsApp send failed for ${queueItem.activity.title}: ${waError.error}`);
+              }
+              
+              // Delay between messages to avoid rate limiting
+              await wait(1500);
+            } catch (waError) {
+              totalFailed++;
+              logger.error(`[API] Failed to send WhatsApp for ${queueItem.activity.title}:`, waError.message);
+            }
+          }
+        }
+      }
+      
+      logger.info(`[API] ✓ WhatsApp queue processed: ${totalSent}/${totalQueued} sent, ${totalFailed} failed`);
+      
+    } catch (waStatusError) {
+      logger.error('[API] Error checking WhatsApp status:', waStatusError.message);
+    }
+
     return NextResponse.json({
       success: true,
       total: students.length,
-      results: results
+      results: results,
+      whatsapp: {
+        status: 'ready',
+        queued: totalQueued,
+        sent: totalSent,
+        failed: totalFailed
+      }
     });
 
   } catch (error) {
