@@ -183,234 +183,358 @@ export async function navigateToCalendar(page) {
 }
 
 /**
- * Scrape activities from the To-Do Calendar (FullCalendar widget)
+ * Parse date from Due Date column (handles formats like "Dec 26, 2025 11:59 PM" or "Jan 05, 2026")
+ * @param {string} dateText - Date text from table cell (may include "X days left" text)
+ * @returns {Date|null} - Parsed date or null if invalid
+ */
+function parseDueDate(dateText) {
+  if (!dateText) return null;
+  
+  try {
+    // Extract just the date part (before any <br> or newline)
+    const datePart = dateText.split('<br>')[0].split('\n')[0].trim();
+    
+    // Parse the date - handles formats like "Dec 26, 2025 11:59 PM" or "Jan 05, 2026"
+    const parsed = new Date(datePart);
+    
+    // Check if valid
+    if (isNaN(parsed.getTime())) {
+      return null;
+    }
+    
+    return parsed;
+  } catch (error) {
+    console.error('Error parsing date:', dateText, error);
+    return null;
+  }
+}
+
+/**
+ * Check if a date is within the next 7 days
+ * @param {Date} dueDate - Due date to check
+ * @param {Date} today - Current date
+ * @returns {boolean} - True if within next 7 days
+ */
+function isWithinNext7Days(dueDate, today) {
+  if (!dueDate || !(dueDate instanceof Date)) return false;
+  
+  // Set time to start of day for accurate comparison
+  const dueDateStart = new Date(dueDate);
+  dueDateStart.setHours(0, 0, 0, 0);
+  
+  const todayStart = new Date(today);
+  todayStart.setHours(0, 0, 0, 0);
+  
+  // Calculate 7 days from today
+  const sevenDaysLater = new Date(todayStart);
+  sevenDaysLater.setDate(sevenDaysLater.getDate() + 7);
+  
+  // Check if due date is between today and 7 days from now (inclusive)
+  return dueDateStart >= todayStart && dueDateStart <= sevenDaysLater;
+}
+
+/**
+ * Scrape activities from the tabCClassic section (tables view)
+ * Extracts from Assignments, Quizzes, GDB, and Practicals tables
  * @param {Page} page - Puppeteer page instance
- * @returns {Promise<Array>} - Array of activity objects
+ * @returns {Promise<Array>} - Array of activity objects (filtered for next 7 days only)
  */
 export async function scrapeActivities(page) {
   try {
-    console.log('[SCRAPING] Extracting activities from FullCalendar widget...');
+    console.log('[SCRAPING] Extracting activities from tabCClassic tables...');
 
     // Wait for dynamic content to fully load
     await wait(3000);
 
-    // Verify the calendar div is present
-    const calendarExists = await page.$('#calendar');
-    if (!calendarExists) {
-      console.error('[SCRAPING] FullCalendar widget not found!');
+    // Verify the tabCClassic section is present
+    const tabExists = await page.$('#tabCClassic');
+    if (!tabExists) {
+      console.error('[SCRAPING] tabCClassic section not found!');
       return [];
     }
 
-    console.log('[SCRAPING] FullCalendar widget found, parsing events...');
+    console.log('[SCRAPING] tabCClassic section found, parsing tables...');
 
-    // Extract activities from the FullCalendar widget
+    // Extract activities from all tables in tabCClassic
     const activities = await page.evaluate(() => {
-      const calendar = document.querySelector('#calendar');
-      if (!calendar) {
-        console.error('Calendar not found in page context');
-        return [];
-      }
-
-      const activityMap = new Map(); // Use Map to deduplicate activities
+      const allActivities = [];
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
       
-      // Try to get events directly from FullCalendar instance
-      let eventsFromFC = [];
-      try {
-        // Check if FullCalendar instance exists
-        const fcElement = document.querySelector('#calendar');
-        if (window.$ && fcElement && window.$(fcElement).data('fullCalendar')) {
-          const fcInstance = window.$(fcElement).fullCalendar('clientEvents');
-          eventsFromFC = fcInstance || [];
-          console.log(`Found ${eventsFromFC.length} events from FullCalendar API`);
-        }
-      } catch (e) {
-        console.log('Could not access FullCalendar API, falling back to DOM parsing');
-      }
-
-      // Get current month for filtering
-      const now = new Date();
-      const currentMonth = now.getMonth();
-      const currentYear = now.getFullYear();
-      
-      // Process events from FullCalendar API if available
-      if (eventsFromFC.length > 0) {
-        eventsFromFC.forEach(event => {
-          try {
-            const title = event.title || '';
-            const link = event.url || '';
-            const startDate = event.start ? event.start.toISOString().split('T')[0] : '';
-            
-            // FullCalendar end dates are EXCLUSIVE (next day at midnight)
-            // Subtract 1 day to get the actual last day
-            let endDate = startDate;
-            if (event.end) {
-              const endDateObj = new Date(event.end);
-              endDateObj.setDate(endDateObj.getDate() - 1);
-              endDate = endDateObj.toISOString().split('T')[0];
-            }
-            
-            // Filter: Only include activities from current month
-            const activityDate = new Date(endDate || startDate);
-            if (activityDate.getMonth() !== currentMonth || activityDate.getFullYear() !== currentYear) {
-              return; // Skip activities not in current month
-            }
-            
-            // Parse course code from title
-            const courseCodeMatch = title.match(/^([A-Z]{2,4}\d{3,4}[A-Z]?)/);
-            const courseCode = courseCodeMatch ? courseCodeMatch[1] : '';
-            
-            // Determine activity type
-            let activityType = 'Unknown';
-            const lowerTitle = title.toLowerCase();
-            const lowerLink = link.toLowerCase();
-            
-            if (lowerTitle.includes('assignment') || lowerLink.includes('assignment')) {
-              activityType = 'Assignment';
-            } else if (lowerTitle.includes('quiz') && lowerTitle.includes('result')) {
-              activityType = 'Quiz Result';
-            } else if (lowerTitle.includes('quiz') || lowerLink.includes('quiz')) {
-              activityType = 'Quiz';
-            } else if (lowerTitle.includes('gdb') && lowerTitle.includes('result')) {
-              activityType = 'GDB Result';
-            } else if (lowerTitle.includes('gdb') || lowerLink.includes('gdb')) {
-              activityType = 'GDB';
-            } else if (lowerTitle.includes('fee') || lowerTitle.includes('challan') || lowerLink.includes('challan')) {
-              activityType = 'Pending Fee';
-            }
-            
-            const activityKey = `${courseCode}|${title}`;
-            
-            if (!activityMap.has(activityKey)) {
-              activityMap.set(activityKey, {
-                course_code: courseCode || 'N/A',
-                activity_type: activityType,
-                title: title,
-                start_date: startDate,
-                due_date: endDate,
-                link: link
-              });
-            }
-          } catch (err) {
-            console.error('Error parsing FC event:', err);
-          }
-        });
-      } else {
-        // Fallback: Parse from DOM elements
-        const eventElements = calendar.querySelectorAll('a.fc-day-grid-event');
-        console.log(`Found ${eventElements.length} event elements in DOM`);
+      // Helper function to parse date from table cell
+      function parseDueDateInBrowser(dateText) {
+        if (!dateText) return null;
         
-        eventElements.forEach(eventEl => {
-          try {
-            // Extract title
-            const titleEl = eventEl.querySelector('.fc-title');
-            if (!titleEl) return;
-            
-            const title = titleEl.innerText.trim();
-            const link = eventEl.href;
-            
-            // Parse course code from title
-            const courseCodeMatch = title.match(/^([A-Z]{2,4}\d{3,4}[A-Z]?)/);
-            const courseCode = courseCodeMatch ? courseCodeMatch[1] : '';
-            
-            // Determine activity type
-            let activityType = 'Unknown';
-            const lowerTitle = title.toLowerCase();
-            const lowerLink = link.toLowerCase();
-            
-            if (lowerTitle.includes('assignment') || lowerLink.includes('assignment')) {
-              activityType = 'Assignment';
-            } else if (lowerTitle.includes('quiz') && lowerTitle.includes('result')) {
-              activityType = 'Quiz Result';
-            } else if (lowerTitle.includes('quiz') || lowerLink.includes('quiz')) {
-              activityType = 'Quiz';
-            } else if (lowerTitle.includes('gdb') && lowerTitle.includes('result')) {
-              activityType = 'GDB Result';
-            } else if (lowerTitle.includes('gdb') || lowerLink.includes('gdb')) {
-              activityType = 'GDB';
-            } else if (lowerTitle.includes('fee') || lowerTitle.includes('challan') || lowerLink.includes('challan')) {
-              activityType = 'Pending Fee';
-            }
-            
-            // Get date from parent cell
-            let startDate = '';
-            let endDate = '';
-            
-            // Find the parent TD with data-date attribute
-            const parentTd = eventEl.closest('td[data-date]');
-            if (parentTd) {
-              const cellDate = parentTd.getAttribute('data-date');
-              
-              // Check if event spans multiple days
-              const isStart = eventEl.classList.contains('fc-start');
-              const isEnd = eventEl.classList.contains('fc-end');
-              const isNotStart = eventEl.classList.contains('fc-not-start');
-              const isNotEnd = eventEl.classList.contains('fc-not-end');
-              
-              // If it's a start, this is the start date
-              if (isStart) {
-                startDate = cellDate;
-              }
-              
-              // If it's an end, this is the end date
-              if (isEnd) {
-                endDate = cellDate;
-              }
-              
-              // If it's single-day event (both start and end)
-              if (isStart && isEnd) {
-                startDate = cellDate;
-                endDate = cellDate;
-              }
-            }
-            
-            // Create unique key
-            const activityKey = `${courseCode}|${title}`;
-            
-            // Merge with existing or create new
-            if (activityMap.has(activityKey)) {
-              const existing = activityMap.get(activityKey);
-              if (startDate && !existing.start_date) {
-                existing.start_date = startDate;
-              }
-              if (endDate) {
-                existing.due_date = endDate;
-              }
-            } else {
-              activityMap.set(activityKey, {
-                course_code: courseCode || 'N/A',
-                activity_type: activityType,
-                title: title,
-                start_date: startDate,
-                due_date: endDate,
-                link: link
-              });
-            }
-          } catch (err) {
-            console.error('Error parsing event element:', err);
+        try {
+          // Clean up the text - remove extra whitespace and newlines
+          const cleanText = dateText.replace(/\s+/g, ' ').trim();
+          
+          // Extract just the date part (before "X days left" or before <br>)
+          let datePart = cleanText;
+          
+          // Remove the "X days left" part if present
+          const daysLeftIndex = cleanText.toLowerCase().indexOf('days left');
+          if (daysLeftIndex > 0) {
+            datePart = cleanText.substring(0, daysLeftIndex).trim();
           }
-        });
+          
+          // Remove trailing period if present
+          if (datePart.endsWith('.')) {
+            datePart = datePart.slice(0, -1);
+          }
+          
+          // Parse the date
+          const parsed = new Date(datePart);
+          
+          // Check if valid
+          if (isNaN(parsed.getTime())) {
+            return null;
+          }
+          
+          return parsed;
+        } catch (error) {
+          console.error('Error parsing date:', dateText, error);
+          return null;
+        }
       }
       
-      // Convert map to array
-      const activityList = Array.from(activityMap.values());
+      // Helper function to check if date is within next 7 days
+      function isWithinNext7DaysInBrowser(dueDate, todayDate) {
+        if (!dueDate || !(dueDate instanceof Date)) return false;
+        
+        const dueDateStart = new Date(dueDate);
+        dueDateStart.setHours(0, 0, 0, 0);
+        
+        const todayStart = new Date(todayDate);
+        todayStart.setHours(0, 0, 0, 0);
+        
+        const sevenDaysLater = new Date(todayStart);
+        sevenDaysLater.setDate(sevenDaysLater.getDate() + 7);
+        
+        return dueDateStart >= todayStart && dueDateStart <= sevenDaysLater;
+      }
       
-      // Return all activities (don't filter here, let the API route handle filtering)
-      return activityList.filter(activity => 
-        activity.title && activity.link
-      );
+      // Helper function to format date as YYYY-MM-DD
+      function formatDate(date) {
+        if (!date) return '';
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+      }
+      
+      // 1. Extract Assignments from MainContent_gvAssignmentsToDo
+      try {
+        const assignmentTable = document.querySelector('#MainContent_gvAssignmentsToDo');
+        if (assignmentTable) {
+          const rows = assignmentTable.querySelectorAll('tbody tr');
+          console.log(`Found ${rows.length} rows in Assignments table`);
+          
+          rows.forEach((row, index) => {
+            // Skip header row
+            if (index === 0 || row.querySelector('th')) return;
+            
+            try {
+              const cells = row.querySelectorAll('td');
+              if (cells.length >= 5) {
+                const courseCode = cells[0].textContent.trim();
+                const title = cells[1].textContent.trim();
+                const openDate = cells[2].textContent.trim();
+                const dueDateText = cells[3].textContent.trim();
+                const actionCell = cells[4];
+                
+                // Parse due date
+                const dueDate = parseDueDateInBrowser(dueDateText);
+                
+                // Only include if within next 7 days
+                if (dueDate && isWithinNext7DaysInBrowser(dueDate, today)) {
+                  // Extract link from action cell
+                  const linkElement = actionCell.querySelector('a');
+                  let link = '';
+                  if (linkElement) {
+                    // Extract the actual URL from href or onclick
+                    const href = linkElement.getAttribute('href');
+                    if (href && href.includes('OpenActivitySection.aspx')) {
+                      const urlMatch = href.match(/OpenActivitySection\.aspx\?[^"']+/);
+                      if (urlMatch) {
+                        link = urlMatch[0];
+                      }
+                    }
+                  }
+                  
+                  allActivities.push({
+                    course_code: courseCode,
+                    activity_type: 'Assignment',
+                    title: title,
+                    start_date: openDate,
+                    due_date: formatDate(dueDate),
+                    due_date_raw: dueDateText,
+                    link: link || '#'
+                  });
+                }
+              }
+            } catch (err) {
+              console.error('Error parsing assignment row:', err);
+            }
+          });
+        } else {
+          console.log('Assignments table not found');
+        }
+      } catch (err) {
+        console.error('Error extracting assignments:', err);
+      }
+      
+      // 2. Extract Quizzes from MainContent_gvQuizzesToDo
+      try {
+        const quizTable = document.querySelector('#MainContent_gvQuizzesToDo');
+        if (quizTable) {
+          const rows = quizTable.querySelectorAll('tbody tr');
+          console.log(`Found ${rows.length} rows in Quizzes table`);
+          
+          rows.forEach((row, index) => {
+            // Skip header row
+            if (index === 0 || row.querySelector('th')) return;
+            
+            try {
+              const cells = row.querySelectorAll('td');
+              if (cells.length >= 5) {
+                const courseCode = cells[0].textContent.trim();
+                const title = cells[1].textContent.trim();
+                const openDate = cells[2].textContent.trim();
+                const dueDateText = cells[3].textContent.trim();
+                
+                // Parse due date
+                const dueDate = parseDueDateInBrowser(dueDateText);
+                
+                // Only include if within next 7 days
+                if (dueDate && isWithinNext7DaysInBrowser(dueDate, today)) {
+                  allActivities.push({
+                    course_code: courseCode,
+                    activity_type: 'Quiz',
+                    title: title,
+                    start_date: openDate,
+                    due_date: formatDate(dueDate),
+                    due_date_raw: dueDateText,
+                    link: '#'
+                  });
+                }
+              }
+            } catch (err) {
+              console.error('Error parsing quiz row:', err);
+            }
+          });
+        } else {
+          console.log('Quizzes table not found');
+        }
+      } catch (err) {
+        console.error('Error extracting quizzes:', err);
+      }
+      
+      // 3. Extract GDB from MainContent_gvGDBsToDo
+      try {
+        const gdbTable = document.querySelector('#MainContent_gvGDBsToDo');
+        if (gdbTable) {
+          // Check if it's the "no pending" message
+          const noPendingText = gdbTable.textContent.toLowerCase();
+          if (!noPendingText.includes('no gdb is pending')) {
+            const rows = gdbTable.querySelectorAll('tbody tr');
+            console.log(`Found ${rows.length} rows in GDB table`);
+            
+            rows.forEach((row, index) => {
+              // Skip header row
+              if (index === 0 || row.querySelector('th')) return;
+              
+              try {
+                const cells = row.querySelectorAll('td');
+                if (cells.length >= 5) {
+                  const courseCode = cells[0].textContent.trim();
+                  const title = cells[1].textContent.trim();
+                  const openDate = cells[2].textContent.trim();
+                  const dueDateText = cells[3].textContent.trim();
+                  
+                  // Parse due date
+                  const dueDate = parseDueDateInBrowser(dueDateText);
+                  
+                  // Only include if within next 7 days
+                  if (dueDate && isWithinNext7DaysInBrowser(dueDate, today)) {
+                    allActivities.push({
+                      course_code: courseCode,
+                      activity_type: 'GDB',
+                      title: title,
+                      start_date: openDate,
+                      due_date: formatDate(dueDate),
+                      due_date_raw: dueDateText,
+                      link: '#'
+                    });
+                  }
+                }
+              } catch (err) {
+                console.error('Error parsing GDB row:', err);
+              }
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error extracting GDB:', err);
+      }
+      
+      // 4. Extract Practicals from MainContent_gvPracticalsToDo
+      try {
+        const practicalTable = document.querySelector('#MainContent_gvPracticalsToDo');
+        if (practicalTable) {
+          // Check if it's the "no pending" message
+          const noPendingText = practicalTable.textContent.toLowerCase();
+          if (!noPendingText.includes('no practical is pending')) {
+            const rows = practicalTable.querySelectorAll('tbody tr');
+            console.log(`Found ${rows.length} rows in Practicals table`);
+            
+            rows.forEach((row, index) => {
+              // Skip header row
+              if (index === 0 || row.querySelector('th')) return;
+              
+              try {
+                const cells = row.querySelectorAll('td');
+                if (cells.length >= 5) {
+                  const courseCode = cells[0].textContent.trim();
+                  const title = cells[1].textContent.trim();
+                  const openDate = cells[2].textContent.trim();
+                  const dueDateText = cells[3].textContent.trim();
+                  
+                  // Parse due date
+                  const dueDate = parseDueDateInBrowser(dueDateText);
+                  
+                  // Only include if within next 7 days
+                  if (dueDate && isWithinNext7DaysInBrowser(dueDate, today)) {
+                    allActivities.push({
+                      course_code: courseCode,
+                      activity_type: 'Practical',
+                      title: title,
+                      start_date: openDate,
+                      due_date: formatDate(dueDate),
+                      due_date_raw: dueDateText,
+                      link: '#'
+                    });
+                  }
+                }
+              } catch (err) {
+                console.error('Error parsing practical row:', err);
+              }
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error extracting practicals:', err);
+      }
+      
+      console.log(`Extracted ${allActivities.length} activities within next 7 days`);
+      return allActivities;
     });
 
-    console.log(`[SCRAPING] ✓ Extracted ${activities.length} unique activities`);
+    console.log(`[SCRAPING] ✓ Extracted ${activities.length} activities due within next 7 days`);
     
-    // If no activities found, log the content for debugging
+    // If no activities found, log for debugging
     if (activities.length === 0) {
-      console.warn('[SCRAPING] No activities found. Checking calendar content...');
-      try {
-        const htmlContent = await page.$eval('#calendar', el => el.innerHTML);
-        console.log('[SCRAPING] Calendar HTML preview:', htmlContent.substring(0, 1000));
-      } catch (htmlError) {
-        console.error('[SCRAPING] Could not read calendar HTML:', htmlError.message);
-      }
+      console.warn('[SCRAPING] No activities found within next 7 days.');
     } else {
       // Log sample activities for debugging
       console.log('[SCRAPING] Sample activities:', JSON.stringify(activities.slice(0, 3), null, 2));
